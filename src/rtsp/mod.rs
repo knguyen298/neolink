@@ -301,8 +301,7 @@ async fn camera_main(camera: NeoInstance, rtsp: &NeoRtspServer) -> Result<()> {
         let use_splash = camera_config.borrow().use_splash;
         let splash_pattern = camera_config.borrow().splash_pattern.to_string();
 
-        // This select is for changes to camera_config.stream
-        break tokio::select! {
+        let stream_result = tokio::select! {
             v = camera_config.wait_for(|config| config.stream != prev_stream_config || config.permitted_users != prev_stream_users || config.use_splash != use_splash) => {
                 if let Err(e) = v {
                     AnyResult::Err(e.into())
@@ -312,7 +311,7 @@ async fn camera_main(camera: NeoInstance, rtsp: &NeoRtspServer) -> Result<()> {
                 }
             },
             v = async {
-                // This select handles enabling the right stream
+                // This select handles enabling the right streams
                 // and setting up the users
                 let all_users = rtsp.get_users().await?.iter().filter(|a| *a != "anyone" && *a != "anonymous").cloned().collect::<HashSet<_>>();
                 let permitted_users: HashSet<String> = match &prev_stream_users {
@@ -331,11 +330,16 @@ async fn camera_main(camera: NeoInstance, rtsp: &NeoRtspServer) -> Result<()> {
                 // Create the dummy factory
                 let dummy_factory = make_dummy_factory(use_splash, splash_pattern).await?;
                 dummy_factory.add_permitted_roles(&permitted_users);
-                let mut supported_streams_1 = supported_streams.clone();
-                let mut supported_streams_2 = supported_streams.clone();
-                let mut supported_streams_3 = supported_streams.clone();
-                tokio::select! {
-                    v = async {
+
+                let mut stream_tasks = JoinSet::new();
+
+                if active_streams.contains(&StreamKind::Main) {
+                    let mut supported_streams = supported_streams.clone();
+                    let camera = camera.clone();
+                    let rtsp = rtsp.clone();
+                    let permitted_users = permitted_users.clone();
+                    let dummy_factory = dummy_factory.clone();
+                    stream_tasks.spawn(async move {
                         let name = camera.config().await?.borrow().name.clone();
                         let mut paths = vec![
                             format!("/{name}/main"),
@@ -345,14 +349,11 @@ async fn camera_main(camera: NeoInstance, rtsp: &NeoRtspServer) -> Result<()> {
                             format!("/{name}/Mainstream"),
                             format!("/{name}/mainstream"),
                         ];
-                        paths.push(
-                            format!("/{name}")
-                        );
+                        paths.push(format!("/{name}"));
                         // Create a dummy factory so that the URL will not return 404 while waiting
                         // for configuration to compete
                         //
                         // This is for BI since it will give up forever on a 404 rather then retry
-                        //
                         let mounts = rtsp
                             .mount_points()
                             .ok_or(anyhow!("RTSP server lacks mount point"))?;
@@ -362,10 +363,22 @@ async fn camera_main(camera: NeoInstance, rtsp: &NeoRtspServer) -> Result<()> {
                         }
                         log::debug!("{}: Preparing at {}", name, paths.join(", "));
 
-                        supported_streams_1.wait_for(|ss| ss.contains(&StreamKind::Main)).await?;
-                        stream_main(camera.clone(), StreamKind::Main, rtsp, &permitted_users, &paths).await
-                    }, if active_streams.contains(&StreamKind::Main) => v,
-                    v = async {
+                        supported_streams
+                            .wait_for(|ss| ss.contains(&StreamKind::Main))
+                            .await?;
+                        stream_main(camera, StreamKind::Main, &rtsp, &permitted_users, &paths)
+                            .await
+                    });
+                }
+
+                if active_streams.contains(&StreamKind::Sub) {
+                    let mut supported_streams = supported_streams.clone();
+                    let camera = camera.clone();
+                    let rtsp = rtsp.clone();
+                    let permitted_users = permitted_users.clone();
+                    let dummy_factory = dummy_factory.clone();
+                    let add_root_path = !active_streams.contains(&StreamKind::Main);
+                    stream_tasks.spawn(async move {
                         let name = camera.config().await?.borrow().name.clone();
                         let mut paths = vec![
                             format!("/{name}/sub"),
@@ -375,17 +388,14 @@ async fn camera_main(camera: NeoInstance, rtsp: &NeoRtspServer) -> Result<()> {
                             format!("/{name}/Substream"),
                             format!("/{name}/substream"),
                         ];
-                        if ! active_streams.contains(&StreamKind::Main) {
-                            paths.push(
-                                format!("/{name}")
-                            );
+                        if add_root_path {
+                            paths.push(format!("/{name}"));
                         }
 
                         // Create a dummy factory so that the URL will not return 404 while waiting
                         // for configuration to compete
                         //
                         // This is for BI since it will give up forever on a 404 rather then retry
-                        //
                         let mounts = rtsp
                             .mount_points()
                             .ok_or(anyhow!("RTSP server lacks mount point"))?;
@@ -396,11 +406,24 @@ async fn camera_main(camera: NeoInstance, rtsp: &NeoRtspServer) -> Result<()> {
                         }
                         log::debug!("{}: Preparing at {}", name, paths.join(", "));
 
-                        supported_streams_2.wait_for(|ss| ss.contains(&StreamKind::Sub)).await?;
+                        supported_streams
+                            .wait_for(|ss| ss.contains(&StreamKind::Sub))
+                            .await?;
 
-                        stream_main(camera.clone(), StreamKind::Sub, rtsp, &permitted_users, &paths).await
-                    }, if active_streams.contains(&StreamKind::Sub) => v,
-                    v = async {
+                        stream_main(camera, StreamKind::Sub, &rtsp, &permitted_users, &paths).await
+                    });
+                }
+
+                if active_streams.contains(&StreamKind::Extern) {
+                    let mut supported_streams = supported_streams.clone();
+                    let camera = camera.clone();
+                    let rtsp = rtsp.clone();
+                    let permitted_users = permitted_users.clone();
+                    let dummy_factory = dummy_factory.clone();
+                    let add_root_path =
+                        !active_streams.contains(&StreamKind::Main)
+                            && !active_streams.contains(&StreamKind::Sub);
+                    stream_tasks.spawn(async move {
                         let name = camera.config().await?.borrow().name.clone();
                         let mut paths = vec![
                             format!("/{name}/extern"),
@@ -410,17 +433,14 @@ async fn camera_main(camera: NeoInstance, rtsp: &NeoRtspServer) -> Result<()> {
                             format!("/{name}/Externstream"),
                             format!("/{name}/externstream"),
                         ];
-                        if ! active_streams.contains(&StreamKind::Main) && ! active_streams.contains(&StreamKind::Sub) {
-                            paths.push(
-                                format!("/{name}")
-                            );
+                        if add_root_path {
+                            paths.push(format!("/{name}"));
                         }
 
                         // Create a dummy factory so that the URL will not return 404 while waiting
                         // for configuration to compete
                         //
                         // This is for BI since it will give up forever on a 404 rather then retry
-                        //
                         let mounts = rtsp
                             .mount_points()
                             .ok_or(anyhow!("RTSP server lacks mount point"))?;
@@ -430,16 +450,30 @@ async fn camera_main(camera: NeoInstance, rtsp: &NeoRtspServer) -> Result<()> {
                         }
                         log::debug!("{}: Preparing at {}", name, paths.join(", "));
 
-                        supported_streams_3.wait_for(|ss| ss.contains(&StreamKind::Extern)).await?;
-                        stream_main(camera.clone(), StreamKind::Extern, rtsp, &permitted_users, &paths).await
-                    }, if active_streams.contains(&StreamKind::Extern) => v,
-                    else => {
-                        // all disabled just wait here until config is changed
-                        futures::future::pending().await
+                        supported_streams
+                            .wait_for(|ss| ss.contains(&StreamKind::Extern))
+                            .await?;
+                        stream_main(camera, StreamKind::Extern, &rtsp, &permitted_users, &paths)
+                            .await
+                    });
+                }
+
+                if stream_tasks.is_empty() {
+                    futures::future::pending().await
+                }
+
+                while let Some(result) = stream_tasks.join_next().await {
+                    match result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => return Err(e),
+                        Err(e) => return Err(e.into()),
                     }
                 }
+
+                AnyResult::Ok(())
             } => v,
         };
+        stream_result?;
     }?;
 
     Ok(())

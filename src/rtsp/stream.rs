@@ -4,8 +4,30 @@ use std::collections::HashSet;
 
 use crate::{common::NeoInstance, AnyResult};
 use neolink_core::bc_protocol::StreamKind;
+use tokio::task::JoinHandle;
 
 use super::{factory::*, gst::NeoRtspServer};
+
+struct ThreadGuard {
+    handle: Option<JoinHandle<AnyResult<()>>>,
+}
+
+impl ThreadGuard {
+    async fn join(mut self) -> AnyResult<()> {
+        if let Some(handle) = self.handle.take() {
+            handle.await??;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ThreadGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
 
 /// This handles the stream itself by creating the factory and pushing messages into it
 pub(crate) async fn stream_main(
@@ -22,6 +44,9 @@ pub(crate) async fn stream_main(
         .ok_or(anyhow!("RTSP server lacks mount point"))?;
     // Create the factory
     let (factory, thread) = make_factory(camera, stream).await?;
+    let thread = ThreadGuard {
+        handle: Some(thread),
+    };
 
     factory.add_permitted_roles(users);
 
@@ -31,6 +56,6 @@ pub(crate) async fn stream_main(
     }
     log::info!("{}: Available at {}", name, paths.join(", "));
 
-    thread.await??;
+    thread.join().await?;
     Ok(())
 }
