@@ -474,7 +474,5 @@ async fn camera_main(camera: NeoInstance, rtsp: &NeoRtspServer) -> Result<()> {
             } => v,
         };
         stream_result?;
-    }?;
-
-    Ok(())
+    }
 }
