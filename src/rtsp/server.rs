@@ -59,6 +59,9 @@ struct ConnectionState {
     video_setup: bool,
     audio_setup: bool,
     video_rtp: Option<RtpState>,
+    audio_rtp: Option<RtpState>,
+    video_channel: u8,
+    audio_channel: u8,
 }
 
 impl ConnectionState {
@@ -72,6 +75,9 @@ impl ConnectionState {
             video_setup: false,
             audio_setup: false,
             video_rtp: None,
+            audio_rtp: None,
+            video_channel: CHANNEL_VIDEO_RTP,
+            audio_channel: CHANNEL_AUDIO_RTP,
         }
     }
 
@@ -102,8 +108,13 @@ impl ConnectionState {
         let writer = self.writer.clone();
         let enable_audio = self.audio_setup;
         let video_rtp = self.video_rtp.take().unwrap_or_else(|| RtpState::new(90_000));
+        let audio_rtp = self.audio_rtp.take();
+        let video_channel = self.video_channel;
+        let audio_channel = self.audio_channel;
         self.stream_task = Some(tokio::spawn(async move {
-            if let Err(e) = stream_loop(writer, stream, enable_audio, video_rtp).await {
+            if let Err(e) =
+                stream_loop(writer, stream, enable_audio, video_rtp, audio_rtp, video_channel, audio_channel).await
+            {
                 log::warn!("RTSP stream loop error: {e}");
             }
         }));
@@ -190,14 +201,21 @@ async fn handle_connection(stream: tokio::net::TcpStream, registry: Arc<StreamRe
                     continue;
                 }
                 let session = state.ensure_session();
+                let (interleaved_rtp, interleaved_rtcp) =
+                    parse_interleaved(&transport_header).unwrap_or((
+                        if track_id == 0 { 0 } else { 2 },
+                        if track_id == 0 { 1 } else { 3 },
+                    ));
                 let transport = match track_id {
                     0 => {
                         state.video_setup = true;
-                        "RTP/AVP/TCP;unicast;interleaved=0-1".to_string()
+                        state.video_channel = interleaved_rtp;
+                        format!("RTP/AVP/TCP;unicast;interleaved={}-{}", interleaved_rtp, interleaved_rtcp)
                     }
                     1 => {
                         state.audio_setup = true;
-                        "RTP/AVP/TCP;unicast;interleaved=2-3".to_string()
+                        state.audio_channel = interleaved_rtp;
+                        format!("RTP/AVP/TCP;unicast;interleaved={}-{}", interleaved_rtp, interleaved_rtcp)
                     }
                     _ => return Err(anyhow!("Unsupported track")),
                 };
@@ -216,11 +234,25 @@ async fn handle_connection(stream: tokio::net::TcpStream, registry: Arc<StreamRe
                 }
                 let base_uri = request.uri.trim_end_matches('/');
                 let mut video_rtp = RtpState::new(90_000);
-                let rtp_info = format!(
+                let mut rtp_infos = vec![format!(
                     "url={}/trackID=0;seq={};rtptime={}",
                     base_uri,
                     video_rtp.current_seq(),
                     video_rtp.current_timestamp()
+                )];
+                if state.audio_setup {
+                    let audio_rtp = RtpState::new(48_000);
+                    rtp_infos.push(format!(
+                        "url={}/trackID=1;seq={};rtptime={}",
+                        base_uri,
+                        audio_rtp.current_seq(),
+                        audio_rtp.current_timestamp()
+                    ));
+                    state.audio_rtp = Some(audio_rtp);
+                }
+                let rtp_info = format!(
+                    "{}",
+                    rtp_infos.join(",")
                 );
                 state.video_rtp = Some(video_rtp);
                 state.start_streaming();
@@ -229,7 +261,11 @@ async fn handle_connection(stream: tokio::net::TcpStream, registry: Arc<StreamRe
                     &state.writer,
                     request.headers.get("cseq"),
                     (200, "OK"),
-                    vec![("Session", session), ("Range", "npt=0-".to_string()), ("RTP-Info", rtp_info)],
+                    vec![
+                        ("Session", session),
+                        ("Range", "npt=0-".to_string()),
+                        ("RTP-Info", rtp_info),
+                    ],
                     "".into(),
                 )
                 .await?;
@@ -385,9 +421,11 @@ async fn stream_loop(
     stream: Arc<StreamState>,
     enable_audio: bool,
     mut video_rtp: RtpState,
+    mut audio_rtp: Option<RtpState>,
+    video_channel: u8,
+    audio_channel: u8,
 ) -> Result<()> {
     let mut rx = stream.subscribe();
-    let mut audio_rtp: Option<RtpState> = None;
     let mut started = false;
 
     let snapshot = stream.snapshot().await;
@@ -402,6 +440,8 @@ async fn stream_loop(
                 enable_audio,
                 &mut video_rtp,
                 &mut audio_rtp,
+                video_channel,
+                audio_channel,
                 &mut started,
             )
             .await?;
@@ -435,6 +475,8 @@ async fn process_packet(
     enable_audio: bool,
     video_rtp: &mut RtpState,
     audio_rtp: &mut Option<RtpState>,
+    video_channel: u8,
+    audio_channel: u8,
     started: &mut bool,
 ) -> Result<()> {
     match packet {
@@ -453,7 +495,7 @@ async fn process_packet(
                 *started = true;
             }
             let timestamp = video_rtp.next_timestamp(*timestamp_us);
-            send_video_frame(writer, video_rtp, *video_type, data, timestamp).await?;
+            send_video_frame(writer, video_rtp, *video_type, data, timestamp, video_channel).await?;
         }
         MediaPacket::Audio {
             codec,
@@ -473,7 +515,7 @@ async fn process_packet(
             }
             let samples = samples_from_duration(*duration_us, *sample_rate);
             let timestamp = rtp.advance_samples(samples);
-            send_audio_packet(writer, rtp, payload, timestamp).await?;
+            send_audio_packet(writer, rtp, payload, timestamp, audio_channel).await?;
         }
     }
     Ok(())
@@ -509,17 +551,17 @@ async fn send_parameter_sets(
     match video_type {
         neolink_core::bcmedia::model::VideoType::H264 => {
             if let (Some(sps), Some(pps)) = (meta.sps.as_ref(), meta.pps.as_ref()) {
-                send_video_nal(writer, rtp, video_type, sps, timestamp, false).await?;
-                send_video_nal(writer, rtp, video_type, pps, timestamp, false).await?;
+                send_video_nal(writer, rtp, video_type, sps, timestamp, false, CHANNEL_VIDEO_RTP).await?;
+                send_video_nal(writer, rtp, video_type, pps, timestamp, false, CHANNEL_VIDEO_RTP).await?;
             }
         }
         neolink_core::bcmedia::model::VideoType::H265 => {
             if let (Some(vps), Some(sps), Some(pps)) =
                 (meta.vps.as_ref(), meta.sps.as_ref(), meta.pps.as_ref())
             {
-                send_video_nal(writer, rtp, video_type, vps, timestamp, false).await?;
-                send_video_nal(writer, rtp, video_type, sps, timestamp, false).await?;
-                send_video_nal(writer, rtp, video_type, pps, timestamp, false).await?;
+                send_video_nal(writer, rtp, video_type, vps, timestamp, false, CHANNEL_VIDEO_RTP).await?;
+                send_video_nal(writer, rtp, video_type, sps, timestamp, false, CHANNEL_VIDEO_RTP).await?;
+                send_video_nal(writer, rtp, video_type, pps, timestamp, false, CHANNEL_VIDEO_RTP).await?;
             }
         }
     }
@@ -532,6 +574,7 @@ async fn send_video_frame(
     video_type: neolink_core::bcmedia::model::VideoType,
     data: &[u8],
     timestamp: u32,
+    channel: u8,
 ) -> Result<()> {
     let nalus = split_nalus(data);
     if nalus.is_empty() {
@@ -539,7 +582,7 @@ async fn send_video_frame(
     }
     for (idx, nal) in nalus.iter().enumerate() {
         let marker = idx + 1 == nalus.len();
-        send_video_nal(writer, rtp, video_type, nal, timestamp, marker).await?;
+        send_video_nal(writer, rtp, video_type, nal, timestamp, marker, channel).await?;
     }
     Ok(())
 }
@@ -551,13 +594,14 @@ async fn send_video_nal(
     nal: &[u8],
     timestamp: u32,
     marker: bool,
+    channel: u8,
 ) -> Result<()> {
     match video_type {
         neolink_core::bcmedia::model::VideoType::H264 => {
-            send_h264_nal(writer, rtp, nal, timestamp, marker).await
+            send_h264_nal(writer, rtp, nal, timestamp, marker, channel).await
         }
         neolink_core::bcmedia::model::VideoType::H265 => {
-            send_h265_nal(writer, rtp, nal, timestamp, marker).await
+            send_h265_nal(writer, rtp, nal, timestamp, marker, channel).await
         }
     }
 }
@@ -568,12 +612,13 @@ async fn send_h264_nal(
     nal: &[u8],
     timestamp: u32,
     marker: bool,
+    channel: u8,
 ) -> Result<()> {
     if nal.is_empty() {
         return Ok(());
     }
     if nal.len() <= RTP_MAX_PAYLOAD {
-        send_rtp_packet(writer, CHANNEL_VIDEO_RTP, rtp, RTP_VIDEO_PT, marker, timestamp, nal)
+        send_rtp_packet(writer, channel, rtp, RTP_VIDEO_PT, marker, timestamp, nal)
             .await?;
         return Ok(());
     }
@@ -593,7 +638,7 @@ async fn send_h264_nal(
         payload.push(fu_indicator);
         payload.push(fu_header);
         payload.extend_from_slice(chunk);
-        send_rtp_packet(writer, CHANNEL_VIDEO_RTP, rtp, RTP_VIDEO_PT, marker && last, timestamp, &payload)
+        send_rtp_packet(writer, channel, rtp, RTP_VIDEO_PT, marker && last, timestamp, &payload)
             .await?;
         first = false;
         offset = end;
@@ -607,12 +652,13 @@ async fn send_h265_nal(
     nal: &[u8],
     timestamp: u32,
     marker: bool,
+    channel: u8,
 ) -> Result<()> {
     if nal.len() < 3 {
         return Ok(());
     }
     if nal.len() <= RTP_MAX_PAYLOAD {
-        send_rtp_packet(writer, CHANNEL_VIDEO_RTP, rtp, RTP_VIDEO_PT, marker, timestamp, nal)
+        send_rtp_packet(writer, channel, rtp, RTP_VIDEO_PT, marker, timestamp, nal)
             .await?;
         return Ok(());
     }
@@ -635,7 +681,7 @@ async fn send_h265_nal(
         payload.push(fu_indicator1);
         payload.push(fu_header);
         payload.extend_from_slice(chunk);
-        send_rtp_packet(writer, CHANNEL_VIDEO_RTP, rtp, RTP_VIDEO_PT, marker && last, timestamp, &payload)
+        send_rtp_packet(writer, channel, rtp, RTP_VIDEO_PT, marker && last, timestamp, &payload)
             .await?;
         first = false;
         offset = end;
@@ -648,13 +694,14 @@ async fn send_audio_packet(
     rtp: &mut RtpState,
     payload: &[u8],
     timestamp: u32,
+    channel: u8,
 ) -> Result<()> {
     let mut offset = 0;
     while offset < payload.len() {
         let end = (offset + RTP_MAX_PAYLOAD).min(payload.len());
         let chunk = &payload[offset..end];
         let marker = end == payload.len();
-        send_rtp_packet(writer, CHANNEL_AUDIO_RTP, rtp, RTP_AUDIO_PT, marker, timestamp, chunk).await?;
+        send_rtp_packet(writer, channel, rtp, RTP_AUDIO_PT, marker, timestamp, chunk).await?;
         offset = end;
     }
     Ok(())
@@ -787,8 +834,20 @@ fn split_nalus(data: &[u8]) -> Vec<&[u8]> {
     nalus
 }
 
+fn parse_interleaved(transport: &str) -> Option<(u8, u8)> {
+    let token = transport.split(';').find(|part| part.trim_start().starts_with("interleaved="))?;
+    let values = token.trim_start().trim_start_matches("interleaved=");
+    let mut parts = values.split('-');
+    let first = parts.next()?.parse::<u8>().ok()?;
+    let second = parts.next()?.parse::<u8>().ok()?;
+    Some((first, second))
+}
+
 fn build_sdp(path: &str, meta: &StreamMeta) -> String {
-    let mut sdp = format!("v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns={}\r\nt=0 0\r\n", path);
+    let mut sdp = format!(
+        "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns={}\r\nc=IN IP4 0.0.0.0\r\nt=0 0\r\n",
+        path
+    );
     let mut has_video = false;
 
     if let Some(video_type) = meta.video_type {
