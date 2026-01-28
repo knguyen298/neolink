@@ -213,9 +213,7 @@ async fn handle_connection(stream: tokio::net::TcpStream, registry: Arc<StreamRe
                         format!("RTP/AVP/TCP;unicast;interleaved={}-{}", interleaved_rtp, interleaved_rtcp)
                     }
                     1 => {
-                        state.audio_setup = true;
-                        state.audio_channel = interleaved_rtp;
-                        format!("RTP/AVP/TCP;unicast;interleaved={}-{}", interleaved_rtp, interleaved_rtcp)
+                        return Err(anyhow!("Audio track is currently disabled"));
                     }
                     _ => return Err(anyhow!("Unsupported track")),
                 };
@@ -889,21 +887,8 @@ fn build_sdp(path: &str, meta: &StreamMeta) -> String {
         sdp.push_str("a=control:trackID=0\r\n");
     }
 
-    let audio_track_id = if has_video { 1 } else { 0 };
-    if let Some(AudioCodec::Aac {
-        sample_rate,
-        channels,
-        config,
-        ..
-    }) = meta.audio.as_ref()
-    {
-        let payload = RTP_AUDIO_PT;
-        sdp.push_str(&format!("m=audio 0 RTP/AVP {payload}\r\n"));
-        sdp.push_str(&format!(
-            "a=rtpmap:{payload} MP4A-LATM/{sample_rate}/{channels}\r\n"
-        ));
-        sdp.push_str(&format!("a=fmtp:{payload} streamtype=5;profile-level-id=15;mode=AAC-hbr;config={:02X}{:02X}\r\n", config[0], config[1]));
-        sdp.push_str(&format!("a=control:trackID={audio_track_id}\r\n"));
+    if meta.audio.is_some() {
+        log::warn!("Audio is currently disabled in RTSP SDP to avoid AAC LATM incompatibilities.");
     }
     sdp
 }
