@@ -142,7 +142,7 @@ async fn handle_connection(stream: tokio::net::TcpStream, registry: Arc<StreamRe
                     .get(&path)
                     .await
                     .ok_or_else(|| anyhow!("Stream not found"))?;
-                let meta = stream.meta().await;
+                let meta = wait_for_meta(&stream).await;
                 let body = build_sdp(&path, &meta);
                 let base = request.uri.clone();
                 send_response(
@@ -825,4 +825,27 @@ fn build_sdp(path: &str, meta: &StreamMeta) -> String {
         sdp.push_str(&format!("a=control:trackID={audio_track_id}\r\n"));
     }
     sdp
+}
+
+async fn wait_for_meta(stream: &StreamState) -> StreamMeta {
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
+    loop {
+        let meta = stream.meta().await;
+        let ready = match meta.video_type {
+            Some(neolink_core::bcmedia::model::VideoType::H264) => {
+                meta.sps.is_some() && meta.pps.is_some()
+            }
+            Some(neolink_core::bcmedia::model::VideoType::H265) => {
+                meta.vps.is_some() && meta.sps.is_some() && meta.pps.is_some()
+            }
+            None => false,
+        };
+        if ready {
+            return meta;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return meta;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
 }
