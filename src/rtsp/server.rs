@@ -165,6 +165,25 @@ async fn handle_connection(stream: tokio::net::TcpStream, registry: Arc<StreamRe
                     .await
                     .ok_or_else(|| anyhow!("Stream not found"))?;
                 state.stream = Some(stream);
+                let transport_header = request
+                    .headers
+                    .get("transport")
+                    .map(|v| v.to_lowercase())
+                    .unwrap_or_default();
+                if !transport_header.contains("tcp") {
+                    send_response(
+                        &state.writer,
+                        request.headers.get("cseq"),
+                        (461, "Unsupported Transport"),
+                        vec![(
+                            "Transport",
+                            "RTP/AVP/TCP;unicast;interleaved=0-1".to_string(),
+                        )],
+                        "".into(),
+                    )
+                    .await?;
+                    continue;
+                }
                 let session = state.ensure_session();
                 let transport = match track_id {
                     0 => {

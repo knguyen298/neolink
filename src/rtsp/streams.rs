@@ -162,7 +162,7 @@ impl StreamBuffer {
 
 impl StreamState {
     pub(crate) fn new(stream_kind: StreamKind, buffer_duration_ms: u64) -> Self {
-        let capacity = (buffer_duration_ms as usize / 30).max(5).min(256);
+        let capacity = (buffer_duration_ms as usize / 30).max(30).min(2000);
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         Self {
             buffer_duration_ms,
