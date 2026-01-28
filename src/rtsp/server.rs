@@ -180,6 +180,7 @@ async fn handle_connection(stream: tokio::net::TcpStream, registry: Arc<StreamRe
                     .get(&stream_path)
                     .await
                     .ok_or_else(|| anyhow!("Stream not found"))?;
+                let meta = stream.meta().await;
                 state.stream = Some(stream);
                 let transport_header = request
                     .headers
@@ -213,7 +214,12 @@ async fn handle_connection(stream: tokio::net::TcpStream, registry: Arc<StreamRe
                         format!("RTP/AVP/TCP;unicast;interleaved={}-{}", interleaved_rtp, interleaved_rtcp)
                     }
                     1 => {
-                        return Err(anyhow!("Audio track is currently disabled"));
+                        if meta.audio.is_none() {
+                            return Err(anyhow!("Audio not available"));
+                        }
+                        state.audio_setup = true;
+                        state.audio_channel = interleaved_rtp;
+                        format!("RTP/AVP/TCP;unicast;interleaved={}-{}", interleaved_rtp, interleaved_rtcp)
                     }
                     _ => return Err(anyhow!("Unsupported track")),
                 };
@@ -239,7 +245,16 @@ async fn handle_connection(stream: tokio::net::TcpStream, registry: Arc<StreamRe
                     video_rtp.current_timestamp()
                 )];
                 if state.audio_setup {
-                    let audio_rtp = RtpState::new(48_000);
+                    let sample_rate = if let Some(stream) = state.stream.as_ref() {
+                        let meta = stream.meta().await;
+                        match meta.audio {
+                            Some(AudioCodec::Aac { sample_rate, .. }) => sample_rate,
+                            _ => 48_000,
+                        }
+                    } else {
+                        48_000
+                    };
+                    let audio_rtp = RtpState::new(sample_rate);
                     rtp_infos.push(format!(
                         "url={}/trackID=1;seq={};rtptime={}",
                         base_uri,
@@ -491,7 +506,15 @@ async fn process_packet(
                     return Ok(());
                 }
                 let meta = stream.meta().await;
-                send_parameter_sets(writer, video_rtp, *video_type, &meta, *timestamp_us).await?;
+                send_parameter_sets(
+                    writer,
+                    video_rtp,
+                    *video_type,
+                    &meta,
+                    *timestamp_us,
+                    video_channel,
+                )
+                .await?;
                 *started = true;
             }
             let timestamp = video_rtp.next_timestamp(*timestamp_us);
@@ -546,22 +569,23 @@ async fn send_parameter_sets(
     video_type: neolink_core::bcmedia::model::VideoType,
     meta: &StreamMeta,
     timestamp_us: u32,
+    channel: u8,
 ) -> Result<()> {
     let timestamp = rtp.next_timestamp(timestamp_us);
     match video_type {
         neolink_core::bcmedia::model::VideoType::H264 => {
             if let (Some(sps), Some(pps)) = (meta.sps.as_ref(), meta.pps.as_ref()) {
-                send_video_nal(writer, rtp, video_type, sps, timestamp, false, CHANNEL_VIDEO_RTP).await?;
-                send_video_nal(writer, rtp, video_type, pps, timestamp, false, CHANNEL_VIDEO_RTP).await?;
+                send_video_nal(writer, rtp, video_type, sps, timestamp, false, channel).await?;
+                send_video_nal(writer, rtp, video_type, pps, timestamp, false, channel).await?;
             }
         }
         neolink_core::bcmedia::model::VideoType::H265 => {
             if let (Some(vps), Some(sps), Some(pps)) =
                 (meta.vps.as_ref(), meta.sps.as_ref(), meta.pps.as_ref())
             {
-                send_video_nal(writer, rtp, video_type, vps, timestamp, false, CHANNEL_VIDEO_RTP).await?;
-                send_video_nal(writer, rtp, video_type, sps, timestamp, false, CHANNEL_VIDEO_RTP).await?;
-                send_video_nal(writer, rtp, video_type, pps, timestamp, false, CHANNEL_VIDEO_RTP).await?;
+                send_video_nal(writer, rtp, video_type, vps, timestamp, false, channel).await?;
+                send_video_nal(writer, rtp, video_type, sps, timestamp, false, channel).await?;
+                send_video_nal(writer, rtp, video_type, pps, timestamp, false, channel).await?;
             }
         }
     }
@@ -696,14 +720,13 @@ async fn send_audio_packet(
     timestamp: u32,
     channel: u8,
 ) -> Result<()> {
-    let mut offset = 0;
-    while offset < payload.len() {
-        let end = (offset + RTP_MAX_PAYLOAD).min(payload.len());
-        let chunk = &payload[offset..end];
-        let marker = end == payload.len();
-        send_rtp_packet(writer, channel, rtp, RTP_AUDIO_PT, marker, timestamp, chunk).await?;
-        offset = end;
-    }
+    let payload_bits = (payload.len() * 8) as u16;
+    let au_header = (payload_bits << 3) & 0xFFF8;
+    let mut au_payload = Vec::with_capacity(4 + payload.len());
+    au_payload.extend_from_slice(&(16u16).to_be_bytes());
+    au_payload.extend_from_slice(&au_header.to_be_bytes());
+    au_payload.extend_from_slice(payload);
+    send_rtp_packet(writer, channel, rtp, RTP_AUDIO_PT, true, timestamp, &au_payload).await?;
     Ok(())
 }
 
@@ -887,8 +910,25 @@ fn build_sdp(path: &str, meta: &StreamMeta) -> String {
         sdp.push_str("a=control:trackID=0\r\n");
     }
 
-    if meta.audio.is_some() {
-        log::warn!("Audio is currently disabled in RTSP SDP to avoid AAC LATM incompatibilities.");
+    if let Some(AudioCodec::Aac {
+        sample_rate,
+        channels,
+        config,
+        ..
+    }) = meta.audio.as_ref()
+    {
+        let payload = RTP_AUDIO_PT;
+        sdp.push_str(&format!("m=audio 0 RTP/AVP {payload}\r\n"));
+        sdp.push_str(&format!(
+            "a=rtpmap:{payload} MPEG4-GENERIC/{sample_rate}/{channels}\r\n"
+        ));
+        sdp.push_str(&format!(
+            "a=fmtp:{payload} streamtype=5;profile-level-id=1;mode=AAC-hbr;config={:02X}{:02X};sizelength=13;indexlength=3;indexdeltalength=3\r\n",
+            config[0],
+            config[1]
+        ));
+        let audio_track_id = if has_video { 1 } else { 0 };
+        sdp.push_str(&format!("a=control:trackID={audio_track_id}\r\n"));
     }
     sdp
 }
