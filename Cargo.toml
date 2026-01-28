@@ -47,7 +47,7 @@ validator = {version="0.18.1", features = ["derive"] }
 tikv-jemallocator = "0.5"
 
 [features]
-default = ["gstreamer"]
+default = []
 gstreamer = [
   "dep:gstreamer",
   "dep:gstreamer-app",

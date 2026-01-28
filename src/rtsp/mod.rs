@@ -4,7 +4,6 @@ use std::time::Duration;
 use tokio::task;
 use tokio::time::sleep;
 
-use crate::cmdline::Opt;
 use crate::common::{NeoInstance, NeoReactor};
 use crate::config::CameraConfig;
 use crate::rtsp::server::RtspServer;
@@ -62,17 +61,9 @@ async fn run_stream(instance: NeoInstance, kind: StreamKind, state: Arc<StreamSt
     loop {
         match instance.stream(kind).await {
             Ok(mut rx) => {
-                while let Some(media) = rx.recv().await {
-                    match media {
-                        Ok(bc_media) => {
-                            if let Some(packet) = MediaPacket::try_from_bcmedia(bc_media) {
-                                state.push_packet(Arc::new(packet)).await;
-                            }
-                        }
-                        Err(e) => {
-                            log::warn!("{} stream error: {e}", state.stream_name());
-                            break;
-                        }
+                while let Some(bc_media) = rx.recv().await {
+                    if let Some(packet) = MediaPacket::try_from_bcmedia(bc_media) {
+                        state.push_packet(Arc::new(packet)).await;
                     }
                 }
             }

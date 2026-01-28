@@ -1,6 +1,4 @@
 use anyhow::Context;
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::Engine;
 use neolink_core::bc_protocol::StreamKind;
 use neolink_core::bcmedia::model::{BcMedia, BcMediaAac, BcMediaAdpcm, BcMediaIframe, BcMediaPframe, VideoType};
 use std::collections::{HashMap, VecDeque};
@@ -49,7 +47,7 @@ pub(crate) enum MediaPacket {
 }
 
 impl MediaPacket {
-    fn try_from_bcmedia(media: BcMedia) -> Option<Self> {
+    pub(crate) fn try_from_bcmedia(media: BcMedia) -> Option<Self> {
         match media {
             BcMedia::Iframe(BcMediaIframe { video_type, data, microseconds, .. }) => Some(
                 MediaPacket::Video {
@@ -204,19 +202,18 @@ impl StreamState {
             MediaPacket::Video { video_type, data, .. } => {
                 meta.video_type = Some(*video_type);
                 for nal in split_nalus(data) {
-                    if *video_type == VideoType::H264 {
-                        match nal[0] & 0x1F {
+                    match video_type {
+                        VideoType::H264 => match nal[0] & 0x1F {
                             7 => meta.sps = Some(nal.to_vec()),
                             8 => meta.pps = Some(nal.to_vec()),
                             _ => {}
-                        }
-                    } else if *video_type == VideoType::H265 {
-                        match (nal[0] >> 1) & 0x3F {
+                        },
+                        VideoType::H265 => match (nal[0] >> 1) & 0x3F {
                             32 => meta.vps = Some(nal.to_vec()),
                             33 => meta.sps = Some(nal.to_vec()),
                             34 => meta.pps = Some(nal.to_vec()),
                             _ => {}
-                        }
+                        },
                     }
                 }
             }

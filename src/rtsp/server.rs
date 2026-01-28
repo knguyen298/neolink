@@ -1,4 +1,6 @@
 use crate::rtsp::streams::{AudioCodec, StreamMeta, StreamRegistry};
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use anyhow::{anyhow, Context, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -102,12 +104,6 @@ async fn process_request(
     request_path: Option<String>,
     session_path: Option<String>,
 ) -> Result<(String, Vec<(&'static str, String)>, (u16, &'static str))> {
-    let cseq = request
-        .headers
-        .get("cseq")
-        .ok_or_else(|| anyhow!("Missing CSeq"))?
-        .clone();
-
     match request.method.as_str() {
         "OPTIONS" => Ok(("".into(), vec![("Public", "OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN".into())], (200, "OK"))),
         "DESCRIBE" => {
