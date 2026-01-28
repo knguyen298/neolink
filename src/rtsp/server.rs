@@ -58,6 +58,7 @@ struct ConnectionState {
     stream_task: Option<JoinHandle<()>>,
     video_setup: bool,
     audio_setup: bool,
+    video_rtp: Option<RtpState>,
 }
 
 impl ConnectionState {
@@ -70,6 +71,7 @@ impl ConnectionState {
             stream_task: None,
             video_setup: false,
             audio_setup: false,
+            video_rtp: None,
         }
     }
 
@@ -99,8 +101,9 @@ impl ConnectionState {
         };
         let writer = self.writer.clone();
         let enable_audio = self.audio_setup;
+        let video_rtp = self.video_rtp.take().unwrap_or_else(|| RtpState::new(90_000));
         self.stream_task = Some(tokio::spawn(async move {
-            if let Err(e) = stream_loop(writer, stream, enable_audio).await {
+            if let Err(e) = stream_loop(writer, stream, enable_audio, video_rtp).await {
                 log::warn!("RTSP stream loop error: {e}");
             }
         }));
@@ -211,13 +214,22 @@ async fn handle_connection(stream: tokio::net::TcpStream, registry: Arc<StreamRe
                 if state.stream.is_none() || !state.video_setup {
                     return Err(anyhow!("Session not established"));
                 }
+                let base_uri = request.uri.trim_end_matches('/');
+                let mut video_rtp = RtpState::new(90_000);
+                let rtp_info = format!(
+                    "url={}/trackID=0;seq={};rtptime={}",
+                    base_uri,
+                    video_rtp.current_seq(),
+                    video_rtp.current_timestamp()
+                );
+                state.video_rtp = Some(video_rtp);
                 state.start_streaming();
                 let session = state.ensure_session();
                 send_response(
                     &state.writer,
                     request.headers.get("cseq"),
                     (200, "OK"),
-                    vec![("Session", session)],
+                    vec![("Session", session), ("Range", "npt=0-".to_string()), ("RTP-Info", rtp_info)],
                     "".into(),
                 )
                 .await?;
@@ -372,9 +384,9 @@ async fn stream_loop(
     writer: Arc<Mutex<OwnedWriteHalf>>,
     stream: Arc<StreamState>,
     enable_audio: bool,
+    mut video_rtp: RtpState,
 ) -> Result<()> {
     let mut rx = stream.subscribe();
-    let mut video_rtp = RtpState::new(90_000);
     let mut audio_rtp: Option<RtpState> = None;
     let mut started = false;
 
@@ -723,6 +735,14 @@ impl RtpState {
         let current = self.seq;
         self.seq = self.seq.wrapping_add(1);
         current
+    }
+
+    fn current_seq(&self) -> u16 {
+        self.seq
+    }
+
+    fn current_timestamp(&self) -> u32 {
+        self.timestamp
     }
 
     fn next_timestamp(&mut self, timestamp_us: u32) -> u32 {
