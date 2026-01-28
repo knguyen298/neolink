@@ -461,6 +461,8 @@ async fn stream_loop(
             enable_audio,
             &mut video_rtp,
             &mut audio_rtp,
+            video_channel,
+            audio_channel,
             &mut started,
         )
         .await?;
