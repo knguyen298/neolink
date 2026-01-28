@@ -22,12 +22,19 @@ pub(crate) async fn main(_opt: Opt, reactor: NeoReactor) -> Result<()> {
     for cam_config in config.cameras.into_iter().filter(|cam| cam.enabled) {
         let reactor = reactor.clone();
         let registry = registry.clone();
+        let bind_addr = config.bind_addr.clone();
+        let bind_port = config.bind_port;
         task::spawn(async move {
-            spawn_camera_streams(reactor, cam_config, registry).await;
+            spawn_camera_streams(reactor, cam_config, registry, bind_addr, bind_port).await;
         });
     }
 
     let server = RtspServer::new(registry.clone());
+    log::info!(
+        "RTSP server listening on {}:{}",
+        config.bind_addr,
+        config.bind_port
+    );
     server.run(&config.bind_addr, config.bind_port).await
 }
 
@@ -35,6 +42,8 @@ async fn spawn_camera_streams(
     reactor: NeoReactor,
     config: CameraConfig,
     registry: Arc<StreamRegistry>,
+    bind_addr: String,
+    bind_port: u16,
 ) {
     let name = config.name.clone();
     let stream_kinds = config.stream.as_stream_kinds();
@@ -48,6 +57,12 @@ async fn spawn_camera_streams(
             let state = Arc::new(StreamState::new(kind, buffer_duration));
             for path in canonical_paths(&name, kind) {
                 registry.register(path, state.clone()).await;
+                log::info!(
+                    "{name} {kind:?}: Stream available at rtsp://{}:{}{}",
+                    bind_addr,
+                    bind_port,
+                    path
+                );
             }
             let instance_clone = instance.clone();
             tokio::spawn(async move {

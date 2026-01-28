@@ -283,8 +283,30 @@ impl StreamRegistry {
 pub(crate) fn canonical_paths(name: &str, stream: StreamKind) -> Vec<String> {
     let base = format!("/{name}");
     match stream {
-        StreamKind::Main => vec![base.clone(), format!("{base}/main"), format!("{base}/mainStream")],
-        StreamKind::Sub => vec![format!("{base}/sub"), format!("{base}/subStream")],
-        StreamKind::Extern => vec![format!("{base}/extern"), format!("{base}/externStream")],
+        StreamKind::Main => vec![
+            base.clone(),
+            format!("{base}/main"),
+            format!("{base}/Main"),
+            format!("{base}/mainStream"),
+            format!("{base}/MainStream"),
+            format!("{base}/mainstream"),
+            format!("{base}/Mainstream"),
+        ],
+        StreamKind::Sub => vec![
+            format!("{base}/sub"),
+            format!("{base}/Sub"),
+            format!("{base}/subStream"),
+            format!("{base}/SubStream"),
+            format!("{base}/substream"),
+            format!("{base}/Substream"),
+        ],
+        StreamKind::Extern => vec![
+            format!("{base}/extern"),
+            format!("{base}/Extern"),
+            format!("{base}/externStream"),
+            format!("{base}/ExternStream"),
+            format!("{base}/externstream"),
+            format!("{base}/Externstream"),
+        ],
     }
 }
