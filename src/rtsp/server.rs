@@ -2,6 +2,11 @@ use crate::rtsp::streams::{AudioCodec, MediaPacket, StreamMeta, StreamRegistry, 
 use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use symphonia_codec_aac::AacDecoder;
+use symphonia_core::audio::{AudioBufferRef, Channels, SampleBuffer};
+use symphonia_core::codecs::{CodecParameters, Decoder, DecoderOptions, CODEC_TYPE_AAC};
+use symphonia_core::errors::Error as SymphoniaError;
+use symphonia_core::formats::Packet;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -62,6 +67,65 @@ struct ConnectionState {
     audio_rtp: Option<RtpState>,
     video_channel: u8,
     audio_channel: u8,
+}
+
+struct AacPcmDecoder {
+    decoder: AacDecoder,
+    sample_rate: u32,
+    channels: usize,
+    sample_buf: SampleBuffer<i16>,
+}
+
+impl AacPcmDecoder {
+    fn new(sample_rate: u32, channels: u8, config: [u8; 2]) -> Result<Self> {
+        let mut params = CodecParameters::new();
+        params.for_codec(CODEC_TYPE_AAC);
+        params.sample_rate = Some(sample_rate);
+        params.channels = Some(match channels {
+            1 => Channels::FRONT_LEFT,
+            _ => Channels::FRONT_LEFT | Channels::FRONT_RIGHT,
+        });
+        params.extra_data = Some(vec![config[0], config[1]].into_boxed_slice());
+        let decoder = AacDecoder::try_new(&params, &DecoderOptions::default())
+            .map_err(|e| anyhow!("AAC decoder init failed: {e:?}"))?;
+        let spec = symphonia_core::audio::SignalSpec::new(sample_rate, params.channels.unwrap());
+        let sample_buf = SampleBuffer::<i16>::new(1024, spec);
+        Ok(Self {
+            decoder,
+            sample_rate,
+            channels: channels as usize,
+            sample_buf,
+        })
+    }
+
+    fn decode(&mut self, data: &[u8]) -> Result<Option<Vec<u8>>> {
+        let packet = Packet::new_from_slice(0, 0, 0, data);
+        let audio = match self.decoder.decode(&packet) {
+            Ok(audio) => audio,
+            Err(SymphoniaError::DecodeError(_)) => return Ok(None),
+            Err(SymphoniaError::IoError(_)) => return Ok(None),
+            Err(SymphoniaError::ResetRequired) => {
+                self.decoder.reset();
+                return Ok(None);
+            }
+            Err(e) => return Err(anyhow!("AAC decode error: {e:?}")),
+        };
+        if self.sample_buf.capacity() < audio.capacity() {
+            self.sample_buf = SampleBuffer::<i16>::new(audio.capacity() as u64, *audio.spec());
+        }
+        self.sample_buf.copy_interleaved_ref(audio);
+        let samples = self.sample_buf.samples();
+        let mut pcm = Vec::with_capacity(samples.len() * 2);
+        for sample in samples {
+            pcm.extend_from_slice(&sample.to_be_bytes());
+        }
+        Ok(Some(pcm))
+    }
+
+    fn samples_per_channel(&self, pcm_bytes: usize) -> u32 {
+        let total_samples = pcm_bytes / 2;
+        (total_samples / self.channels).min(u32::MAX as usize) as u32
+    }
 }
 
 impl ConnectionState {
@@ -440,6 +504,7 @@ async fn stream_loop(
 ) -> Result<()> {
     let mut rx = stream.subscribe();
     let mut started = false;
+    let mut audio_decoder: Option<AacPcmDecoder> = None;
 
     let snapshot = stream.snapshot().await;
     if let Some(start_idx) = snapshot.iter().rposition(|packet| {
@@ -453,6 +518,7 @@ async fn stream_loop(
                 enable_audio,
                 &mut video_rtp,
                 &mut audio_rtp,
+                &mut audio_decoder,
                 video_channel,
                 audio_channel,
                 &mut started,
@@ -474,6 +540,7 @@ async fn stream_loop(
             enable_audio,
             &mut video_rtp,
             &mut audio_rtp,
+            &mut audio_decoder,
             video_channel,
             audio_channel,
             &mut started,
@@ -490,6 +557,7 @@ async fn process_packet(
     enable_audio: bool,
     video_rtp: &mut RtpState,
     audio_rtp: &mut Option<RtpState>,
+    audio_decoder: &mut Option<AacPcmDecoder>,
     video_channel: u8,
     audio_channel: u8,
     started: &mut bool,
@@ -523,22 +591,39 @@ async fn process_packet(
         MediaPacket::Audio {
             codec,
             data,
-            duration_us,
+            duration_us: _,
         } => {
             if !enable_audio || !*started {
                 return Ok(());
             }
-            let AudioCodec::Aac { sample_rate, .. } = codec else {
+            let AudioCodec::Aac {
+                sample_rate,
+                channels,
+                config,
+                ..
+            } = codec
+            else {
                 return Ok(());
             };
             let rtp = audio_rtp.get_or_insert_with(|| RtpState::new(*sample_rate));
+            let decoder = match audio_decoder.as_mut() {
+                Some(decoder) => decoder,
+                None => {
+                    *audio_decoder = Some(AacPcmDecoder::new(*sample_rate, *channels, *config)?);
+                    audio_decoder.as_mut().unwrap()
+                }
+            };
             let payload = strip_adts(data);
             if payload.is_empty() {
                 return Ok(());
             }
-            let samples = samples_from_duration(*duration_us, *sample_rate);
+            let pcm = match decoder.decode(payload)? {
+                Some(pcm) => pcm,
+                None => return Ok(()),
+            };
+            let samples = decoder.samples_per_channel(pcm.len());
             let timestamp = rtp.advance_samples(samples);
-            send_audio_packet(writer, rtp, payload, timestamp, audio_channel).await?;
+            send_audio_packet(writer, rtp, &pcm, timestamp, audio_channel).await?;
         }
     }
     Ok(())
@@ -720,13 +805,14 @@ async fn send_audio_packet(
     timestamp: u32,
     channel: u8,
 ) -> Result<()> {
-    let payload_bits = (payload.len() * 8) as u16;
-    let au_header = (payload_bits << 3) & 0xFFF8;
-    let mut au_payload = Vec::with_capacity(4 + payload.len());
-    au_payload.extend_from_slice(&(16u16).to_be_bytes());
-    au_payload.extend_from_slice(&au_header.to_be_bytes());
-    au_payload.extend_from_slice(payload);
-    send_rtp_packet(writer, channel, rtp, RTP_AUDIO_PT, true, timestamp, &au_payload).await?;
+    let mut offset = 0;
+    while offset < payload.len() {
+        let end = (offset + RTP_MAX_PAYLOAD).min(payload.len());
+        let chunk = &payload[offset..end];
+        let marker = end == payload.len();
+        send_rtp_packet(writer, channel, rtp, RTP_AUDIO_PT, marker, timestamp, chunk).await?;
+        offset = end;
+    }
     Ok(())
 }
 
@@ -913,19 +999,13 @@ fn build_sdp(path: &str, meta: &StreamMeta) -> String {
     if let Some(AudioCodec::Aac {
         sample_rate,
         channels,
-        config,
         ..
     }) = meta.audio.as_ref()
     {
         let payload = RTP_AUDIO_PT;
         sdp.push_str(&format!("m=audio 0 RTP/AVP {payload}\r\n"));
         sdp.push_str(&format!(
-            "a=rtpmap:{payload} MPEG4-GENERIC/{sample_rate}/{channels}\r\n"
-        ));
-        sdp.push_str(&format!(
-            "a=fmtp:{payload} streamtype=5;profile-level-id=1;mode=AAC-hbr;config={:02X}{:02X};sizelength=13;indexlength=3;indexdeltalength=3\r\n",
-            config[0],
-            config[1]
+            "a=rtpmap:{payload} L16/{sample_rate}/{channels}\r\n"
         ));
         let audio_track_id = if has_video { 1 } else { 0 };
         sdp.push_str(&format!("a=control:trackID={audio_track_id}\r\n"));
