@@ -122,6 +122,8 @@ async fn handle_connection(stream: tokio::net::TcpStream, registry: Arc<StreamRe
         let method = request.method.as_str();
         let request_path = request_path(&request.uri).and_then(|p| normalize_path(&p));
 
+        log::debug!("RTSP {} {}", method, request.uri);
+
         match method {
             "OPTIONS" => {
                 send_response(
@@ -216,6 +218,16 @@ async fn handle_connection(stream: tokio::net::TcpStream, registry: Arc<StreamRe
                     request.headers.get("cseq"),
                     (200, "OK"),
                     vec![("Session", session)],
+                    "".into(),
+                )
+                .await?;
+            }
+            "GET_PARAMETER" | "SET_PARAMETER" => {
+                send_response(
+                    &state.writer,
+                    request.headers.get("cseq"),
+                    (200, "OK"),
+                    vec![],
                     "".into(),
                 )
                 .await?;
