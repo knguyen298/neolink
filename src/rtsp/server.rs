@@ -509,8 +509,7 @@ async fn send_h264_nal(
         let end = (offset + max_fragment).min(nal.len());
         let chunk = &nal[offset..end];
         let last = end == nal.len();
-        let fu_header =
-            ((if first { 0x80 } else { 0 }) | (if last { 0x40 } else { 0 }) | nal_type);
+        let fu_header = (if first { 0x80 } else { 0 }) | (if last { 0x40 } else { 0 }) | nal_type;
         let mut payload = Vec::with_capacity(2 + chunk.len());
         payload.push(fu_indicator);
         payload.push(fu_header);
@@ -551,8 +550,7 @@ async fn send_h265_nal(
         let end = (offset + max_fragment).min(nal.len());
         let chunk = &nal[offset..end];
         let last = end == nal.len();
-        let fu_header =
-            ((if first { 0x80 } else { 0 }) | (if last { 0x40 } else { 0 }) | nal_type);
+        let fu_header = (if first { 0x80 } else { 0 }) | (if last { 0x40 } else { 0 }) | nal_type;
         let mut payload = Vec::with_capacity(3 + chunk.len());
         payload.push(fu_indicator0);
         payload.push(fu_indicator1);
@@ -640,7 +638,8 @@ struct RtpState {
 
 impl RtpState {
     fn new(clock_rate: u32) -> Self {
-        let random = Uuid::new_v4().as_bytes();
+        let uuid = Uuid::new_v4();
+        let random = uuid.as_bytes();
         let seq = u16::from_be_bytes([random[0], random[1]]);
         let ssrc = u32::from_be_bytes([random[2], random[3], random[4], random[5]]);
         let timestamp = u32::from_be_bytes([random[6], random[7], random[8], random[9]]);

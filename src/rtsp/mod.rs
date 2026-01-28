@@ -56,7 +56,7 @@ async fn spawn_camera_streams(
             let buffer_duration = config.buffer_duration;
             let state = Arc::new(StreamState::new(kind, buffer_duration));
             for path in canonical_paths(&name, kind) {
-                registry.register(path, state.clone()).await;
+                registry.register(path.clone(), state.clone()).await;
                 log::info!(
                     "{name} {kind:?}: Stream available at rtsp://{}:{}{}",
                     bind_addr,
