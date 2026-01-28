@@ -347,54 +347,90 @@ async fn stream_loop(
     let mut audio_rtp: Option<RtpState> = None;
     let mut started = false;
 
+    let snapshot = stream.snapshot().await;
+    if let Some(start_idx) = snapshot.iter().rposition(|packet| {
+        matches!(packet.as_ref(), MediaPacket::Video { keyframe: true, .. })
+    }) {
+        for packet in snapshot[start_idx..].iter() {
+            process_packet(
+                packet.as_ref(),
+                &writer,
+                &stream,
+                enable_audio,
+                &mut video_rtp,
+                &mut audio_rtp,
+                &mut started,
+            )
+            .await?;
+        }
+    }
+
     loop {
         let packet = match rx.recv().await {
             Ok(packet) => packet,
             Err(broadcast::error::RecvError::Lagged(_)) => continue,
             Err(_) => break,
         };
-        match packet.as_ref() {
-            MediaPacket::Video {
-                video_type,
-                data,
-                timestamp_us,
-                keyframe,
-            } => {
-                if !started {
-                    if !*keyframe {
-                        continue;
-                    }
-                    let meta = stream.meta().await;
-                    send_parameter_sets(&writer, &mut video_rtp, *video_type, &meta, *timestamp_us).await?;
-                    started = true;
+        process_packet(
+            packet.as_ref(),
+            &writer,
+            &stream,
+            enable_audio,
+            &mut video_rtp,
+            &mut audio_rtp,
+            &mut started,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn process_packet(
+    packet: &MediaPacket,
+    writer: &Arc<Mutex<OwnedWriteHalf>>,
+    stream: &StreamState,
+    enable_audio: bool,
+    video_rtp: &mut RtpState,
+    audio_rtp: &mut Option<RtpState>,
+    started: &mut bool,
+) -> Result<()> {
+    match packet {
+        MediaPacket::Video {
+            video_type,
+            data,
+            timestamp_us,
+            keyframe,
+        } => {
+            if !*started {
+                if !*keyframe {
+                    return Ok(());
                 }
-                let timestamp = video_rtp.next_timestamp(*timestamp_us);
-                send_video_frame(&writer, &mut video_rtp, *video_type, data, timestamp).await?;
+                let meta = stream.meta().await;
+                send_parameter_sets(writer, video_rtp, *video_type, &meta, *timestamp_us).await?;
+                *started = true;
             }
-            MediaPacket::Audio {
-                codec,
-                data,
-                duration_us,
-            } => {
-                if !enable_audio {
-                    continue;
-                }
-                let AudioCodec::Aac {
-                    sample_rate,
-                    ..
-                } = codec
-                else {
-                    continue;
-                };
-                let rtp = audio_rtp.get_or_insert_with(|| RtpState::new(*sample_rate));
-                let payload = strip_adts(data);
-                if payload.is_empty() {
-                    continue;
-                }
-                let samples = samples_from_duration(*duration_us, *sample_rate);
-                let timestamp = rtp.advance_samples(samples);
-                send_audio_packet(&writer, rtp, payload, timestamp).await?;
+            let timestamp = video_rtp.next_timestamp(*timestamp_us);
+            send_video_frame(writer, video_rtp, *video_type, data, timestamp).await?;
+        }
+        MediaPacket::Audio {
+            codec,
+            data,
+            duration_us,
+        } => {
+            if !enable_audio || !*started {
+                return Ok(());
             }
+            let AudioCodec::Aac { sample_rate, .. } = codec else {
+                return Ok(());
+            };
+            let rtp = audio_rtp.get_or_insert_with(|| RtpState::new(*sample_rate));
+            let payload = strip_adts(data);
+            if payload.is_empty() {
+                return Ok(());
+            }
+            let samples = samples_from_duration(*duration_us, *sample_rate);
+            let timestamp = rtp.advance_samples(samples);
+            send_audio_packet(writer, rtp, payload, timestamp).await?;
         }
     }
     Ok(())
