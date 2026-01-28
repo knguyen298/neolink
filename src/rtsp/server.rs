@@ -173,34 +173,57 @@ async fn send_response(
 
 fn build_sdp(path: &str, meta: &StreamMeta) -> String {
     let mut sdp = format!("v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns={}\r\nt=0 0\r\n", path);
-    let mut control_id = 0;
+    let mut has_video = false;
+
     if let Some(video_type) = meta.video_type {
+        has_video = true;
         let payload_type = 96;
+        let rtpmap = match video_type {
+            neolink_core::bcmedia::model::VideoType::H264 => "H264/90000",
+            neolink_core::bcmedia::model::VideoType::H265 => "H265/90000",
+        };
         sdp.push_str(&format!("m=video 0 RTP/AVP {}\r\n", payload_type));
-        sdp.push_str("a=rtpmap:96 H264/90000\r\n");
-        if let (Some(sps), Some(pps)) = (meta.sps.as_ref(), meta.pps.as_ref()) {
-            let sps_encoded = BASE64.encode(sps);
-            let pps_encoded = BASE64.encode(pps);
-            sdp.push_str(&format!(
-                "a=fmtp:96 packetization-mode=1;sprop-parameter-sets={sps_encoded},{pps_encoded}\r\n"
-            ));
+        sdp.push_str(&format!("a=rtpmap:{} {}\r\n", payload_type, rtpmap));
+        match video_type {
+            neolink_core::bcmedia::model::VideoType::H264 => {
+                if let (Some(sps), Some(pps)) = (meta.sps.as_ref(), meta.pps.as_ref()) {
+                    let sps_encoded = BASE64.encode(sps);
+                    let pps_encoded = BASE64.encode(pps);
+                    sdp.push_str(&format!(
+                        "a=fmtp:{} packetization-mode=1;sprop-parameter-sets={sps_encoded},{pps_encoded}\r\n",
+                        payload_type
+                    ));
+                }
+            }
+            neolink_core::bcmedia::model::VideoType::H265 => {
+                if let (Some(vps), Some(sps), Some(pps)) =
+                    (meta.vps.as_ref(), meta.sps.as_ref(), meta.pps.as_ref())
+                {
+                    let vps_encoded = BASE64.encode(vps);
+                    let sps_encoded = BASE64.encode(sps);
+                    let pps_encoded = BASE64.encode(pps);
+                    sdp.push_str(&format!(
+                        "a=fmtp:{} sprop-vps={vps_encoded};sprop-sps={sps_encoded};sprop-pps={pps_encoded}\r\n",
+                        payload_type
+                    ));
+                }
+            }
         }
-        sdp.push_str(&format!("a=control:trackID={control_id}\r\n"));
-        control_id += 1;
+        sdp.push_str("a=control:trackID=0\r\n");
     }
+
+    let audio_track_id = if has_video { 1 } else { 0 };
     if let Some(AudioCodec::Aac { sample_rate, channels, config, .. }) = meta.audio.as_ref() {
         let payload = 97;
         sdp.push_str(&format!("m=audio 0 RTP/AVP {payload}\r\n"));
         sdp.push_str(&format!("a=rtpmap:{payload} MP4A-LATM/{sample_rate}/{channels}\r\n"));
         sdp.push_str(&format!("a=fmtp:{payload} streamtype=5;profile-level-id=15;mode=AAC-hbr;config={:02X}{:02X}\r\n", config[0], config[1]));
-        sdp.push_str(&format!("a=control:trackID={control_id}\r\n"));
-        control_id += 1;
+        sdp.push_str(&format!("a=control:trackID={audio_track_id}\r\n"));
     } else if let Some(AudioCodec::Adpcm { sample_rate, channels }) = meta.audio.as_ref() {
         let payload = 98;
         sdp.push_str(&format!("m=audio 0 RTP/AVP {payload}\r\n"));
         sdp.push_str(&format!("a=rtpmap:{payload} DVI4/{sample_rate}/{channels}\r\n"));
-        sdp.push_str(&format!("a=control:trackID={control_id}\r\n"));
-        control_id += 1;
+        sdp.push_str(&format!("a=control:trackID={audio_track_id}\r\n"));
     }
     sdp
 }
