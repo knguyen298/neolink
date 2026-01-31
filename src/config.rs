@@ -1,7 +1,5 @@
 use crate::mqtt::Discoveries;
-#[cfg(feature = "gstreamer")]
-use neolink_core::bc_protocol::StreamKind;
-use neolink_core::bc_protocol::{DiscoveryMethods, PrintFormat};
+use neolink_core::bc_protocol::{DiscoveryMethods, PrintFormat, StreamKind};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -101,27 +99,16 @@ pub(crate) enum StreamConfig {
 }
 
 impl StreamConfig {
-    #[cfg(feature = "gstreamer")]
     pub(crate) fn as_stream_kinds(&self) -> Vec<StreamKind> {
         match self {
             StreamConfig::All => {
                 vec![StreamKind::Main, StreamKind::Extern, StreamKind::Sub]
             }
-            StreamConfig::Both => {
-                vec![StreamKind::Main, StreamKind::Sub]
-            }
-            StreamConfig::Main => {
-                vec![StreamKind::Main]
-            }
-            StreamConfig::Sub => {
-                vec![StreamKind::Sub]
-            }
-            StreamConfig::Extern => {
-                vec![StreamKind::Extern]
-            }
-            StreamConfig::None => {
-                vec![]
-            }
+            StreamConfig::Both => vec![StreamKind::Main, StreamKind::Sub],
+            StreamConfig::Main => vec![StreamKind::Main],
+            StreamConfig::Sub => vec![StreamKind::Sub],
+            StreamConfig::Extern => vec![StreamKind::Extern],
+            StreamConfig::None => vec![],
         }
     }
 }
